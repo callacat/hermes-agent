@@ -9,8 +9,9 @@ compressor are untouched, so the prompt cache is too.
 
 At the next automatic threshold compaction ``compress`` takes the completed
 summary if the messages it covers are still the same messages: same session,
-same head boundary, a boundary no later than the current tail cut, and the same
-message structure (roles, tool call and result ids) up to that boundary, each
+same head boundary, a boundary no later than the current tail cut (or past it
+only by tool calls and results), and the same message structure (roles, tool
+call and result ids) up to that boundary, each
 message vouched for by its durable ``message_uid``. The text of a persisted
 message is not compared: plugins rewrite text in place, and a summary written
 before such a rewrite still summarises the same messages. Only a message that
@@ -144,6 +145,19 @@ class _PendingPass:
             hook(seconds)
 
 
+def _tool_traffic(msg: Any) -> bool:
+    """A tool result, or an assistant row that only calls tools (no visible text)."""
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("role") == "tool":
+        return True
+    if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+        return False
+    from agent.message_content import flatten_message_text
+
+    return not flatten_message_text(msg.get("content")).strip()
+
+
 def _message_identity(msg: Any) -> _Identity:
     """Role, tool call ids/names and tool result ids; the durable ``message_uid`` when the message has
     been persisted; and a digest of its text for messages no uid vouches for. Tool arguments and result
@@ -179,12 +193,17 @@ def prefix_identities(messages: list[dict[str, Any]], end: int) -> tuple[_Identi
 def _mismatch(
     window: _Window, messages: list[dict[str, Any]], session_id: str, start: int, end: int,
 ) -> Optional[_Miss]:
-    """Why *window* cannot splice into the planned window ``[start, end)`` of ``messages``, or None."""
+    """Why *window* cannot splice at ``start`` with the fresh tail cut at ``end`` (a boundary past ``end``
+    only over tool traffic), or None."""
     if window.session_id != session_id:
         return _Miss("other_session", "another session")
     if window.compress_start != start:
         return _Miss("head_moved", f"head moved ({window.compress_start} -> {start})")
-    if window.compress_end > end:
+    # The fresh cut can fall before the boundary: on the longer transcript the prune stubs tool results
+    # near it, so the tail walk keeps more rows. The summary still splices if those rows are only tool
+    # calls and results: never a user turn or visible assistant text (the anchored last visible reply,
+    # #29824).
+    if window.compress_end > end and not all(_tool_traffic(m) for m in messages[end:window.compress_end]):
         return _Miss("inside_tail", f"prepared boundary {window.compress_end} is inside the protected tail (cut {end})")
     if window.compress_end > len(messages):
         return _Miss("transcript_shorter", "transcript shorter than the prepared window")

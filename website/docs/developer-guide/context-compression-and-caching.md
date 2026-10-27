@@ -691,7 +691,11 @@ persisted message, tool arguments and tool bodies are not compared: the no-LLM p
 rewrite them in place, and the summary still describes the same messages. A message without a uid on
 one side (caller-supplied `conversation_history` that is never persisted) is compared by text, since
 nothing else can tell it from a different message. A dropped or inserted message, or a rewind or
-branch into the window (new `message_uid`s), is a miss. The summary then covers
+branch into the window (new `message_uid`s), is a miss. The boundary may also sit past the fresh cut
+when only tool calls and tool results lie between them (the prune stubbed tool results near the
+boundary, so the tail walk now keeps more rows); a user turn or visible assistant text there is a miss,
+since the fresh plan keeps those verbatim; the same check decides whether a compaction waits for a
+running pass. On a splice the summary covers
 `[head, candidate boundary)` and every later message, however many arrived after the pass started, is
 kept as tail; tail rules such as lean-mode tool stubbing still apply to them. Summary placement and
 alternation handling are the normal Phase 4 assembly. The splice leaves the live compressor as the

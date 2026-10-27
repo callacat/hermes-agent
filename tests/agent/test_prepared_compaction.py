@@ -377,6 +377,62 @@ def test_identity_survives_a_session_db_round_trip_and_catches_a_rewind(tmp_path
     assert "different message" in pc._mismatch(window, rewound, "S1", 4, 15)
 
 
+_TOOL_CALL = {"role": "assistant", "content": "", "tool_calls": [
+    {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}
+_TOOL_RESULT = {"role": "tool", "tool_call_id": "c1", "content": "result"}
+
+
+@pytest.mark.parametrize(("between", "splices"), [
+    ([_TOOL_CALL, _TOOL_RESULT], True),
+    ([{**_TOOL_CALL, "content": [{"type": "text", "text": None}]}, _TOOL_RESULT], True),
+    ([{**_TOOL_CALL, "content": "visible preamble"}, _TOOL_RESULT], False),
+    ([{**_TOOL_CALL, "content": [{"type": "text", "content": "visible preamble"}]}, _TOOL_RESULT], False),
+    ([{"role": "assistant", "content": ""}], False),  # no tool calls: not tool traffic, even without text
+    ([{"role": "user", "content": ""}], False),
+], ids=["tool-traffic", "empty-text-part", "call-with-text", "call-with-structured-text", "assistant-no-calls",
+        "user-turn"])
+def test_boundary_past_the_cut_splices_only_over_tool_traffic(between, splices):
+    """The cut can move back past the summary's boundary; splicing then summarises those rows, which is
+    only allowed for tool calls and results, never a user turn or a reply the fresh plan keeps verbatim."""
+    msgs = _messages(10) + between + _messages(4, tag="t")[1:]
+    start, cut = 2, 11
+    boundary = cut + len(between)
+    window = pc._Window("S1", start, boundary, pc.prefix_identities(msgs, boundary))
+    assert (pc._mismatch(window, msgs, "S1", start, cut) is None) is splices
+
+
+def test_compaction_splices_when_the_prune_moves_the_cut_behind_the_boundary():
+    """Through the real planner: on the longer transcript the prune stubs a tool result that left its
+    protected tail, the tail walk keeps more tool rounds, and the cut lands before the prepared boundary.
+    The prepared summary still splices (no inline call), covers the rows between the cut and its
+    boundary, and every later tool round stays verbatim in the tail."""
+    def tool_round(i: int, size: int) -> list:
+        call = {"id": f"c{i}", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "f"}'}}
+        return [{"role": "assistant", "content": "", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": f"c{i}", "content": "r" * size}]
+
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(2):
+        msgs += [{"role": "user", "content": f"u{i} " + "q" * 800}, {"role": "assistant", "content": f"done {i} " + "a" * 800}]
+    msgs.append({"role": "user", "content": "do the task " + "q" * 400})
+    for i in range(8):
+        msgs += tool_round(i, 2000)
+    msgs += tool_round(8, 12000)
+    cc = _compressor()
+    entry = _prepare(cc, msgs)
+    later = msgs + tool_round(9, 1000)
+    _, _, start, end = cc._plan_compaction_window(later)
+    assert start == entry.compress_start and end < entry.compress_end, "the cut must land before the boundary"
+    compressed = cc.compress(later, current_tokens=cc.threshold_tokens + 1)
+    assert [c["worker"] for c in cc.calls] == [True] and entry.summary in _summary_row(compressed)["content"]
+
+    def results(rows: list) -> list:
+        return [m["tool_call_id"] for m in rows if m["role"] == "tool"]
+
+    assert results(later[end:entry.compress_end]), "the gap must hold tool rounds"
+    assert results(compressed) == results(later[entry.compress_end:]), "gap summarised, tail kept verbatim"
+
+
 # --------------------------------------------------------------------------- running passes
 
 
